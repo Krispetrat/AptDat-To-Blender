@@ -1,0 +1,21 @@
+name: Build Windows exe
+# Builds a real AptDatToBlender.exe on GitHub's windows-latest runner.
+# Push this folder to a GitHub repo -> Actions tab -> run finishes in ~2 min
+# -> download the "AptDatToBlender-windows-exe" artifact.
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: pyinstaller --onefile --windowed --name AptDatToBlender aptdat_app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AptDatToBlender-windows-exe
+          path: dist/AptDatToBlender.exe
