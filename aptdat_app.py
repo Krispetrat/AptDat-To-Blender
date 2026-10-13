@@ -6,16 +6,19 @@ apt.dat -> Blender/OBJ airport layout tool.
 GUI mode (default, double-click the .exe / run with no arguments):
     Pick an apt.dat file, then just TYPE in the search box (ICAO, IATA/FAA code,
     airport name or city) and the list narrows as you type. Choose OBJ /
-    Blender-script / both, and generate.
+    Blender-script / both, tick what to include (taxi lines, lights, boundary,
+    taxi network, signs and other placed objects ...), and generate.
 
 CLI mode (for scripting / automation):
     python aptdat_app.py --input apt.dat --icao KNPA --outdir out --format both
+    python aptdat_app.py --input apt.dat --icao KNPA --no-lights --no-network   # leave things out
     python aptdat_app.py --list apt.dat --search pensacola
 """
 
 import os
 import sys
 import argparse
+import dataclasses
 import traceback
 
 import aptdat_core as core
@@ -26,41 +29,69 @@ import aptdat_export as export
 # Shared "do the work" function used by both CLI and GUI
 # --------------------------------------------------------------------------
 
-def generate(input_path: str, icao: str, outdir: str, fmt: str, thickness: float, log=print):
+def generate(input_path: str, icao: str, outdir: str, fmt: str, thickness: float, log=print,
+             options=None, write_json: bool = True):
     log(f"Reading {input_path} ...")
     data = core.parse_airport(input_path, icao)
     if data is None:
         raise ValueError(f"Airport '{icao}' was not found in this apt.dat file "
                          f"(try --list FILE --search TEXT to look it up).")
 
+    opts = (dataclasses.replace(options, slab_thickness=thickness) if options is not None
+            else core.BuildOptions(slab_thickness=thickness))
+
     log(f"Found {data.icao} - {data.name}")
     log(f"  {len(data.runways)} runway(s), {len(data.pavements)} pavement polygon(s), "
         f"{len(data.helipads)} helipad(s)")
+    n_runs = sum(len(f.runs) for f in data.linear_features)
+    n_edge = sum(len(p.edge_runs) for p in data.pavements)
+    log(f"  {len(data.linear_features)} linear feature(s) ({n_runs} styled run(s)), "
+        f"{n_edge} pavement-edge line/light run(s), {len(data.boundaries)} boundary polygon(s)")
+    log(f"  taxi network: {len(data.taxi_nodes)} node(s), {len(data.taxi_edges)} edge(s)")
+    kinds = {}
+    for m in data.markers:
+        kinds[m.kind] = kinds.get(m.kind, 0) + 1
+    if kinds:
+        log("  placed objects: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())))
+    log(f"  {len(data.frequencies)} frequenc(ies), {len(data.flows)} ATC flow(s)")
+    if data.ignored:
+        log("  [note] row codes not handled: " + ", ".join(f"{c} x{n}" for c, n in sorted(data.ignored.items())))
     for w in data.warnings:
         log(f"  [warn] {w}")
 
-    meshes = core.build_meshes(data, slab_thickness=thickness, log=log)
-    if not meshes:
+    meshes = core.build_meshes(data, options=opts, log=log)
+    markers = core.all_markers(data, opts)
+    if not meshes and not markers:
         raise ValueError(f"{data.icao} has no runway, helipad or pavement geometry to export "
                          f"(apt.dat formats older than 1000 are not supported).")
     total_v = sum(len(m.vertices) for m in meshes.values())
     total_f = sum(len(m.faces) for m in meshes.values())
-    log(f"  Built {len(meshes)} mesh groups ({total_v} verts, {total_f} tris)")
+    total_e = sum(len(m.edges) for m in meshes.values())
+    log(f"  Built {len(meshes)} mesh groups ({total_v} verts, {total_f} tris, {total_e} wire edges) "
+        f"+ {len(markers)} placed marker(s)")
 
     os.makedirs(outdir, exist_ok=True)
     outputs = []
 
     if fmt in ("obj", "both"):
         obj_path = os.path.join(outdir, f"{data.icao}_layout.obj")
-        export.export_obj(meshes, obj_path, data)
+        obj_groups = dict(meshes)
+        obj_groups.update(core.build_marker_meshes(markers))     # an OBJ has no empties: markers become small pyramids
+        export.export_obj(obj_groups, obj_path, data)
         outputs.append(obj_path)
         log(f"  Wrote {obj_path}")
 
     if fmt in ("blender", "both"):
         py_path = os.path.join(outdir, f"{data.icao}_layout_blender.py")
-        export.export_blender_script(meshes, py_path, data)
+        export.export_blender_script(meshes, py_path, data, markers)
         outputs.append(py_path)
         log(f"  Wrote {py_path}")
+
+    if write_json:
+        json_path = os.path.join(outdir, f"{data.icao}_data.json")
+        export.export_json(data, json_path)
+        outputs.append(json_path)
+        log(f"  Wrote {json_path}")
 
     log("Done.")
     return outputs
@@ -79,6 +110,17 @@ def run_cli(argv=None):
                      help="Output format (default: both)")
     ap.add_argument("--thickness", "-t", type=float, default=0.0,
                      help="Slab thickness in meters. 0 = flat plane (default).")
+    ap.add_argument("--no-lines", action="store_true", help="Leave out painted lines (taxi lines, hold lines, edge markings).")
+    ap.add_argument("--no-lights", action="store_true", help="Leave out light strings.")
+    ap.add_argument("--no-boundary", action="store_true", help="Leave out the airport boundary.")
+    ap.add_argument("--no-network", action="store_true", help="Leave out the taxi route / ground-vehicle network.")
+    ap.add_argument("--no-runway-extras", action="store_true",
+                    help="Leave out runway shoulders, overruns / blast pads and displaced-threshold bars.")
+    ap.add_argument("--no-markers", action="store_true",
+                    help="Leave out placed objects (signs, windsocks, startups, PAPI/VASI, trucks, runway ends ...).")
+    ap.add_argument("--no-json", action="store_true", help="Do not write the <ICAO>_data.json dump.")
+    ap.add_argument("--light-spacing", type=float, default=15.0,
+                    help="Metres between light dots on a light string (default 15).")
     ap.add_argument("--list", "-l", metavar="APTDAT", help="List the airports found in a file, then exit.")
     ap.add_argument("--search", "-s", metavar="TEXT", default="",
                      help="With --list: only show airports matching TEXT (code, name, city...).")
@@ -100,8 +142,12 @@ def run_cli(argv=None):
     if not args.input or not args.icao:
         ap.error("--input and --icao are required (or use --gui / --list)")
 
+    opts = core.BuildOptions(lines=not args.no_lines, lights=not args.no_lights, boundary=not args.no_boundary,
+                             network=not args.no_network, runway_extras=not args.no_runway_extras,
+                             markers=not args.no_markers, light_spacing=args.light_spacing)
     try:
-        generate(args.input, args.icao, args.outdir, args.format, args.thickness)
+        generate(args.input, args.icao, args.outdir, args.format, args.thickness,
+                 options=opts, write_json=not args.no_json)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -127,8 +173,8 @@ def run_gui():
 
     root = tk.Tk()
     root.title("apt.dat -> Blender Layout Tool")
-    root.geometry("760x820")
-    root.minsize(660, 700)
+    root.geometry("760x960")
+    root.minsize(660, 780)
 
     msgs = queue.Queue()      # worker threads -> UI thread
     state = {"path": None, "index": None, "results": [], "selected": None, "busy": False, "debounce": None}
@@ -185,24 +231,45 @@ def run_gui():
     thickness_var = tk.StringVar(value="0")
     ttk.Entry(frm, textvariable=thickness_var, width=10).grid(row=9, column=0, sticky="w", pady=(0, 8))
 
-    # --- 5. output dir ---
-    ttk.Label(frm, text="5. Output folder:").grid(row=10, column=0, sticky="w")
+    # --- 5. what to include ---
+    inc_frame = ttk.LabelFrame(frm, text="5. Include", padding=(8, 4))
+    inc_frame.grid(row=10, column=0, columnspan=3, sticky="we", pady=(0, 8))
+    inc_vars = {}
+    inc_items = [
+        ("lines", "Painted lines (taxi lines, hold lines, edge markings)"),
+        ("lights", "Light strings (centre line / edge lights)"),
+        ("boundary", "Airport boundary"),
+        ("network", "Taxi routes + ground-vehicle routes"),
+        ("runway_extras", "Runway shoulders, overruns, displaced thresholds"),
+        ("markers", "Signs, windsocks, startups, PAPI/VASI, trucks, runway ends"),
+        ("json", "JSON dump (frequencies, ATC flows, metadata ...)"),
+    ]
+    for n, (key, label) in enumerate(inc_items):
+        inc_vars[key] = tk.BooleanVar(value=True)
+        ttk.Checkbutton(inc_frame, text=label, variable=inc_vars[key]).grid(
+            row=n // 2, column=n % 2, sticky="w", padx=(0, 16))
+    ttk.Label(inc_frame, text="Light spacing (m):").grid(row=4, column=0, sticky="e", pady=(4, 0))
+    spacing_var = tk.StringVar(value="15")
+    ttk.Entry(inc_frame, textvariable=spacing_var, width=8).grid(row=4, column=1, sticky="w", pady=(4, 0))
+
+    # --- 6. output dir ---
+    ttk.Label(frm, text="6. Output folder:").grid(row=11, column=0, sticky="w")
     outdir_var = tk.StringVar(value=_default_outdir())
-    ttk.Entry(frm, textvariable=outdir_var).grid(row=11, column=0, columnspan=2, sticky="we", pady=(0, 8))
-    ttk.Button(frm, text="Browse...", command=lambda: browse_outdir()).grid(row=11, column=2, padx=(6, 0), pady=(0, 8))
+    ttk.Entry(frm, textvariable=outdir_var).grid(row=12, column=0, columnspan=2, sticky="we", pady=(0, 8))
+    ttk.Button(frm, text="Browse...", command=lambda: browse_outdir()).grid(row=12, column=2, padx=(6, 0), pady=(0, 8))
 
     # --- generate + progress ---
     gen_btn = ttk.Button(frm, text="Generate", command=lambda: do_generate())
-    gen_btn.grid(row=12, column=0, sticky="w", pady=(2, 4))
+    gen_btn.grid(row=13, column=0, sticky="w", pady=(2, 4))
     progress_var = tk.DoubleVar(value=0.0)
     progress = ttk.Progressbar(frm, variable=progress_var, maximum=100.0, mode="determinate")
-    progress.grid(row=12, column=1, columnspan=2, sticky="we", padx=(10, 0))
+    progress.grid(row=13, column=1, columnspan=2, sticky="we", padx=(10, 0))
 
     # --- log box ---
     log_box = tk.Text(frm, height=9, state="disabled", bg="#111", fg="#0f0", font=("Consolas", 9))
-    log_box.grid(row=13, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    log_box.grid(row=14, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
     frm.rowconfigure(4, weight=3)
-    frm.rowconfigure(13, weight=2)
+    frm.rowconfigure(14, weight=2)
 
     # ------------------------------------------------------------------
     # helpers
@@ -368,13 +435,26 @@ def run_gui():
         if thickness < 0:
             messagebox.showerror("Invalid thickness", "Slab thickness can't be negative.")
             return
+        try:
+            spacing = float(spacing_var.get().strip() or "15")
+            if spacing <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid spacing", "Light spacing must be a positive number of meters, e.g. 15.")
+            return
+        opts = core.BuildOptions(
+            lines=inc_vars["lines"].get(), lights=inc_vars["lights"].get(), boundary=inc_vars["boundary"].get(),
+            network=inc_vars["network"].get(), runway_extras=inc_vars["runway_extras"].get(),
+            markers=inc_vars["markers"].get(), light_spacing=spacing)
+        write_json = inc_vars["json"].get()
         outdir = outdir_var.get().strip() or _default_outdir()
         path, fmt, ident = state["path"], fmt_var.get(), sel.ident
         set_busy(True, indeterminate=True)
 
         def work():
             try:
-                outputs = generate(path, ident, outdir, fmt, thickness, log=lambda m: post("log", m))
+                outputs = generate(path, ident, outdir, fmt, thickness, log=lambda m: post("log", m),
+                                   options=opts, write_json=write_json)
                 post("done", outputs)
             except Exception as e:
                 post("error", "Error", str(e), traceback.format_exc())
