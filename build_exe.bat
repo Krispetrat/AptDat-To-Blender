@@ -15,7 +15,7 @@ if errorlevel 1 (
 
 echo.
 echo Building AptDatToBlender.exe ...
-pyinstaller --onefile --windowed --name AptDatToBlender aptdat_app.py
+python -m PyInstaller --onefile --windowed --name AptDatToBlender aptdat_app.py
 
 echo.
 echo ===============================================
